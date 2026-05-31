@@ -131,7 +131,6 @@ pub fn main(init: std.process.Init) !void {
     self_id = try std.fmt.parseInt(u16, args.next().?, 10);
     assert(self_id <  port_list.len);
     log.debug("size of gossip message: {}", .{ @sizeOf(MembershipList) });
-    log.debug("id: {}", .{ self_id });
 
     for (port_list, &ip_addres) |port, *addr|
         addr.* = net.IpAddress.parse("127.0.0.1", port) catch unreachable;

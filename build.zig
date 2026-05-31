@@ -18,9 +18,22 @@ pub fn build(b: *Build) void {
     });
     main_mod.addImport("network_config", opts.createModule());
 
-    const exe = b.addExecutable(.{
+    const monitor_mod = b.addModule("monitor", .{
+        .optimize = optimize,
+        .target = target,
+        .root_source_file = b.path("src/monitor.zig"),
+    });
+
+    const node = b.addExecutable(.{
         .name = "node",
         .root_module = main_mod,
     });
-    b.installArtifact(exe);
+    b.installArtifact(node);
+
+    const monitor = b.addExecutable(.{
+        .name = "monitor",
+        .root_module = monitor_mod,
+    });
+    b.installArtifact(monitor);
+
 }
