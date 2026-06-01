@@ -5,23 +5,25 @@ const Duration = Io.Duration;
 const net = Io.net;
 const log = std.log;
 const fatal = std.process.fatal;
+const Allocator = std.mem.Allocator;
 const NetworkConfig = @import("network_config");
 const port_list = NetworkConfig.port_list;
 
 const MAX_NODE = port_list.len;
 var memberships: MembershipList = undefined;
-var ip_addres: [MAX_NODE]net.IpAddress = undefined;
 var self_id: Id = undefined;
 var self_gen: u32 = 1;
 
 const Id = u32;
 
 const Membership = struct {
+    ip_addr: net.IpAddress,
     status: NodeStatus,
     gen: u32,
     last_heard: Io.Timestamp,
+    pending_ack: std.atomic.Value(bool),
     
-    pub const init = Membership { .status = .dead, .gen =  0, .last_heard = .zero };
+    pub const init = Membership { .ip_addr = undefined, .status = .dead, .gen =  0, .last_heard = .zero, .pending_ack = .init(false) };
 };
 const MembershipList = [MAX_NODE]Membership;
 
@@ -46,6 +48,7 @@ const NodeStatus = enum {
     suspected,
     alive,
 
+    pub const NETWORK_ROUNDTRIP_TIME = Duration.fromMilliseconds(1000);
     pub const SUSPECTED_TIMEOUT = Duration.fromMilliseconds(2000);
     pub const DEAD_TIMEOUT = Duration.fromMilliseconds(4000);
     comptime { assert(DEAD_TIMEOUT.nanoseconds > SUSPECTED_TIMEOUT.nanoseconds); }
@@ -58,54 +61,80 @@ const Terminal = struct {
     const move_up = "\x1b[1A";
 };
 
-fn find_id_by_addr(target: net.IpAddress) Id {
-    for (ip_addres, 0..) |addr, id| {
-        if (target.eql(&addr)) return @intCast(id);
-    } else unreachable;
-}
+const Message = struct {
+    from: Id,
+    type: Type, 
+    pub const Type = enum(u8) {
+        ping,
+        ack,
+    };
 
-fn failure_detection_recver(io: Io, sock: *const net.Socket) !void {
-    while (true) {
-        var buf: [@sizeOf(MembershipList)]u8 = undefined;
-        const msg_or_timeout = sock.receiveTimeout(io, &buf, .{ .duration = .{ .raw = NodeStatus.GOSSIP_RECV_TIMEOUT, .clock = .awake } });
-        const now = Io.Clock.now(.awake, io);
-        if (msg_or_timeout) |msg| {
-            const other_memberships: * align(1) MembershipList = std.mem.bytesAsValue(MembershipList, msg.data);
-            const id = find_id_by_addr(msg.from);
-            for (other_memberships, &memberships) |other_member, *member| {
-                if (other_member.gen <= member.gen or other_member.status != .alive) {
-                    continue;
-                }
-                member.gen = other_member.gen;
-                member.last_heard = now;
-                member.status = .alive;
-            }
-            assert(memberships[id].status == .alive);
-        } else |e| {
-            if (e != net.Socket.ReceiveTimeoutError.Timeout) return e;
+    pub const MESSAGE_SIZE = @sizeOf(Message); 
+
+    pub fn serialize(msg: Message) [MESSAGE_SIZE]u8 {
+        return std.mem.asBytes(&msg).*;
+    }
+
+    pub fn deserialize(bytes: []const u8) Message {
+        assert(bytes.len == MESSAGE_SIZE);
+        return std.mem.bytesToValue(Message, bytes);
+    }
+
+    pub fn recv(io: Io, sock: *const net.Socket) !Message {
+        var buf: [Message.MESSAGE_SIZE]u8 = undefined;
+        const raw_msg = try sock.receive(io, &buf);
+        return Message.deserialize(raw_msg.data);
+    }
+};
+
+fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !void {
+    // var arena_state = std.heap.ArenaAllocator.init(gpa);  
+    // const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0);
+    const rand = prng.random();
+
+    var alive_members = std.ArrayList(Membership).empty;
+    ping_loop: while (true) {
+        alive_members.clearRetainingCapacity();
+        for (memberships, 0..) |member, id|
+            if (member.status != .dead and id != self_id) alive_members.append(gpa, member) catch @panic("OOM");
+        if (alive_members.items.len == 0) {
+            try io.sleep(NodeStatus.GOSSIP_INTERVAL, .cpu_process);
+            continue :ping_loop;
         }
 
-        for (&memberships, 0..) |*member, id| {
-            if (id != self_id and member.status != .dead) {
-                const timeout = member.last_heard.durationTo(now);
-                switch (member.status) {
-                    .dead => unreachable,
-                    .suspected => { if (timeout.nanoseconds > NodeStatus.DEAD_TIMEOUT.nanoseconds) member.status = .dead; },
-                    .alive => { if (timeout.nanoseconds > NodeStatus.SUSPECTED_TIMEOUT.nanoseconds) member.status = .suspected; },
-                }
-            }
-        }
+        const ping_target = &alive_members.items[rand.uintAtMost(usize, alive_members.items.len-1)];
+        ping_target.pending_ack.store(true, .release);
+        try sock.send(io, &ping_target.ip_addr, &(Message { .type = .ping, .from = self_id }).serialize());
+
+        const start = Io.Timestamp.now(io, .cpu_process);
+        while (ping_target.pending_ack.load(.acquire)) {
+            const now = Io.Timestamp.now(io, .cpu_process);
+            if (start.durationTo(now).nanoseconds > NodeStatus.GOSSIP_RECV_TIMEOUT.nanoseconds) break;
+        } else continue :ping_loop;
+
+        ping_target.status = .dead;
     }
 }
 
-fn failure_detection_sender(io: Io, sock: *const net.Socket) !void {
+fn failure_detector_server(io: Io, _: Allocator, sock: *const net.Socket) !void {
     while (true) {
-        const copied_memberships = memberships;
-        const bytes = std.mem.asBytes(&copied_memberships);
-        for (ip_addres, 0..) |ip_addr, i|
-            if (i != self_id) try sock.send(io, &ip_addr, bytes);
-        memberships[self_id].gen += 1;
-        try io.sleep(NodeStatus.GOSSIP_INTERVAL, .awake);
+        const msg = Message.recv(io, sock)  catch |e| {
+            log.err("recv failed: {}", .{e});
+            continue;
+        };
+
+        const from = &memberships[msg.from];
+        switch (msg.type) {
+            .ping => {
+                sock.send(io, &from.ip_addr, &(Message { .from = self_id, .type = .ack }).serialize()) catch |e| {
+                    log.err("sending ack to {f} failed: {}", .{ from.ip_addr, e });
+                };   
+            },
+            .ack => {
+                from.pending_ack.store(false, .release);
+            }
+        }
     }
 }
 
@@ -117,6 +146,7 @@ fn print_color(term: Io.Terminal, color: Io.Terminal.Color, comptime fmt: []cons
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    const gpa = init.gpa;
     const stdout_file = Io.File.stdout();
     try stdout_file.enableAnsiEscapeCodes(io);
     var stdout_buf: [256]u8 = undefined;
@@ -132,21 +162,23 @@ pub fn main(init: std.process.Init) !void {
     assert(self_id <  port_list.len);
     log.debug("size of gossip message: {}", .{ @sizeOf(MembershipList) });
 
-    for (port_list, &ip_addres) |port, *addr|
-        addr.* = net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    for (port_list, &memberships) |port, *member|
+        member.ip_addr = net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     
-    const self_addr = ip_addres[self_id];
+    const self_addr = memberships[self_id].ip_addr;
     const sock = try self_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sock.close(io);
 
     @memset(&memberships, .init);
     memberships[self_id] = .{
+        .ip_addr = self_addr,
         .status = .alive,
         .gen = self_gen,
         .last_heard = Io.Timestamp.now(io, .awake),
+        .pending_ack = .init(false),
     };
-    _ = try io.concurrent(failure_detection_recver, .{ io, &sock });
-    _ = try io.concurrent(failure_detection_sender, .{ io, &sock });
+    _ = try io.concurrent(failure_detector_pinger, .{ io, gpa, &sock });
+    _ = try io.concurrent(failure_detector_server, .{ io, gpa, &sock });
 
     const refresh_rate_ns: Io.Duration = .fromMilliseconds(80);
     while (true) {
