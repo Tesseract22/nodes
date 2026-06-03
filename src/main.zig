@@ -3,7 +3,6 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const Duration = Io.Duration;
 const net = Io.net;
-const log = std.log;
 const fatal = std.process.fatal;
 const Allocator = std.mem.Allocator;
 const NetworkConfig = @import("network_config");
@@ -57,12 +56,25 @@ const Terminal = struct {
     const move_up = "\x1b[1A";
 };
 
+fn choose_k_from_members(comptime T: type, random: std.Random, array: []const T, k: u32, exclude: Id, arena: Allocator) []u32 {
+    var allow_indexes = std.ArrayList(u32).empty;
+    for (array, 0..) |_, id| {
+        if (id == exclude) continue;
+        allow_indexes.append(arena, @intCast(id)) catch @panic("OOM");
+    }
+    random.shuffle(u32, allow_indexes.items);
+    return allow_indexes.items[0..@min(k, allow_indexes.items.len)];
+}
+
 const Message = struct {
     from: Id,
+    src: Id,
+    to: Id,
     type: Type,
     pub const Type = enum(u8) {
         ping,
         ack,
+        ping_req,
     };
 
     pub const MESSAGE_SIZE = @sizeOf(Message);
@@ -84,25 +96,29 @@ const Message = struct {
 };
 
 fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !void {
-    // var arena_state = std.heap.ArenaAllocator.init(gpa);
-    // const arena = arena_state.allocator();
+    const log = std.log.scoped(.pinger);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    const arena = arena_state.allocator();
+
     var prng = std.Random.DefaultPrng.init(0);
     const rand = prng.random();
 
-    var alive_members = std.ArrayList(*Membership).empty;
+    var alive_members = std.ArrayList(struct { Id, *Membership }).empty;
     ping_loop: while (true) {
+        _ = arena_state.reset(.retain_capacity);
         try io.sleep(NodeStatus.PING_INTERVAL, .awake);
         alive_members.clearRetainingCapacity();
         for (&memberships, 0..) |*member, id|
-            if (member.status.load(.monotonic) != .dead and id != self_id) alive_members.append(gpa, member) catch @panic("OOM");
+            if (member.status.load(.monotonic) != .dead and id != self_id) alive_members.append(gpa, .{ @intCast(id), member }) catch @panic("OOM");
         if (alive_members.items.len == 0)
             continue :ping_loop;
 
-        const ping_target = alive_members.items[rand.uintAtMost(usize, alive_members.items.len-1)];
+        const ping_id, const ping_target = alive_members.items[rand.uintAtMost(usize, alive_members.items.len-1)];
 
         ping_target.pending_ack.store(0, .monotonic);
-        try sock.send(io, &ping_target.ping_addr, &(Message { .type = .ping, .from = self_id }).serialize());
-        _ = ping_target.pending_ack.store(1, .monotonic);
+        try sock.send(io, &ping_target.ping_addr, &(Message { .type = .ping, .from = self_id, .src = self_id, .to = ping_id }).serialize());
+        _ = ping_target.pending_ack.fetchAdd(1, .monotonic);
 
         const start = Io.Timestamp.now(io, .awake);
         while (ping_target.pending_ack.load(.acquire) > 0) {
@@ -110,11 +126,39 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
             if (start.durationTo(now).nanoseconds > NodeStatus.SUSPECTED_TIMEOUT.nanoseconds) break;
         } else continue :ping_loop;
 
+        const PING_REQ_TARGET_COUNT = 1;
+
+        const ping_req_targets = 
+            choose_k_from_members(struct { u32, *Membership }, rand, alive_members.items, PING_REQ_TARGET_COUNT, ping_id, arena);
+        if (ping_req_targets.len > 0) {
+            for (ping_req_targets) |ping_req_id| {
+                const ping_req_target = &memberships[ping_req_id];
+
+                ping_req_target.pending_ack.store(0, .monotonic);
+                try sock.send(io, &ping_req_target.ping_addr, &(Message { .type = .ping_req, .from = self_id, .src =  self_id, .to = ping_id }).serialize());
+                _ = ping_req_target.pending_ack.fetchAdd(1, .monotonic);
+            }
+
+            while (true) {
+                const now = Io.Timestamp.now(io, .awake);
+                if (start.durationTo(now).nanoseconds > NodeStatus.DEAD_TIMEOUT.nanoseconds) break;
+                for (ping_req_targets) |ping_req_id| {
+                    const ping_req_target = &memberships[ping_req_id];
+                    if (ping_req_target.pending_ack.load(.acquire) <= 0) continue :ping_loop;
+                }
+            }
+        }
+
         ping_target.status.store(.dead, .monotonic);
+        broadcast_change(io, ping_id, .dead) catch |e| {
+            log.err("cannot boardcast dead member {}: {}", .{ ping_id, e });
+            continue :ping_loop;
+        };
     }
 }
 
 fn failure_detector_server(io: Io, _: Allocator, sock: *const net.Socket) !void {
+    const log = std.log.scoped(.ping_server);
     while (true) {
         const msg = Message.recv(io, sock)  catch |e| {
             log.err("recv failed: {}", .{e});
@@ -124,13 +168,23 @@ fn failure_detector_server(io: Io, _: Allocator, sock: *const net.Socket) !void 
         const from = &memberships[msg.from];
         switch (msg.type) {
             .ping => {
-                sock.send(io, &from.ping_addr, &(Message { .from = self_id, .type = .ack }).serialize()) catch |e| {
+                sock.send(io, &from.ping_addr, &(Message { .from = self_id, .src = self_id, .to = msg.src, .type = .ack }).serialize()) catch |e| {
                     log.err("sending ack to {f} failed: {}", .{ from.ping_addr, e });
                 };
             },
             .ack => {
-                _ = from.pending_ack.fetchSub(1, .acquire);
-            }
+                if (msg.to == self_id)
+                    _ = from.pending_ack.fetchSub(1, .acquire)
+                else
+                    sock.send(io, &memberships[msg.to].ping_addr, &(Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ack }).serialize()) catch |e| {
+                        log.err("fowarding ack sourcing from {} to {} failed: {}", .{ msg.src, msg.to, e });
+                    };
+            },
+            .ping_req => {
+                sock.send(io, &memberships[msg.to].ping_addr, &(Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ping }).serialize()) catch |e| {
+                    log.err("fowarding ping sourcing from {} to {} failed: {}", .{ msg.src, msg.to, e });
+                };
+            },
         }
     }
 }
@@ -196,6 +250,7 @@ const Introduction = struct {
 };
 
 fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
+    const log = std.log.scoped(.multicast_server);
     log.info("starting tcp server at {f}", .{ip_addr});
     var server = ip_addr.listen(io, .{ .reuse_address = true }) catch @panic("failed to start multicast server");
     defer server.deinit(io);
@@ -255,7 +310,7 @@ fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
 }
 
 fn intro(io: Io, gpa: Allocator, id: Id, ip_addr: net.IpAddress) !void {
-    log.info("introducing myself: {}", .{ id });
+    std.log.info("introducing myself: {}", .{ id });
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -277,14 +332,14 @@ fn intro(io: Io, gpa: Allocator, id: Id, ip_addr: net.IpAddress) !void {
     for (introduction.memberships) |intro_member| {
         memberships[intro_member.id].status = .init(intro_member.status);
     }
-    log.info("introduction done, new members: {}", .{ introduction.memberships.len });
+    std.log.info("introduction done, new members: {}", .{ introduction.memberships.len });
 }
 
 fn broadcast_change(io: Io, member_id: Id, status: NodeStatus) !void {
     for (memberships, 0..) |member, id| {
         if (id == self_id or member.status.load(.monotonic) == .dead) continue;
         const stream = member.multicast_addr.connect(io, .{ .mode = .stream }) catch |e| {
-            log.err("cannot connect to {f}", .{member.multicast_addr});
+            std.log.err("cannot connect to {f}", .{member.multicast_addr});
             return e;
         };
         defer stream.close(io);
@@ -321,7 +376,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     self_id = try std.fmt.parseInt(u16, args.next().?, 10);
     assert(self_id <  port_list.len);
-    log.debug("size of gossip message: {}", .{ @sizeOf(MembershipList) });
+    std.log.debug("size of gossip message: {}", .{ Message.MESSAGE_SIZE });
 
     for (port_list, &memberships, 0..) |port, *member, id| {
         member.ping_addr = net.IpAddress.parse("127.0.0.1", port) catch unreachable;
@@ -341,7 +396,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try io.concurrent(multicast_server, .{ io, gpa, self_multicast_addr });
     if (self_id != 0)
         intro(io, gpa, self_id, memberships[0].multicast_addr) catch |e| {
-            log.err("node failed introduce itself: {}", .{e});
+            std.log.err("node failed introduce itself: {}", .{e});
             return e;
         };
 
