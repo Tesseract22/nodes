@@ -14,7 +14,7 @@ pub fn build(b: *Build) void {
     });
     const opts = b.addOptions();
     opts.addOption([]const u16, "port_list", &.{
-        8080, 8081, 8082,
+        8000, 8010, 8020, 8030, 8040, 8050, 8060, 8070, 8080, 8090,
     });
     main_mod.addImport("network_config", opts.createModule());
 
