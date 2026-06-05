@@ -6,18 +6,29 @@ const net = Io.net;
 const fatal = std.process.fatal;
 const Allocator = std.mem.Allocator;
 const NetworkConfig = @import("network_config");
+
+const MembershipList = std.AutoArrayHashMapUnmanaged(Id, Membership);
+const Id = u16;
+
 var memberships = MembershipList.empty;
 var member_mtx = Io.Mutex.init;
-const MembershipList = std.AutoArrayHashMapUnmanaged(Id, Membership);
+const PIGGYBACK_CAPACITY = 2;
+var change_index: u32 = 0;
+const ChangeItem = struct {
+    count: u32,
+    change: PackedMember,
+};
+var changes = std.ArrayList(ChangeItem).empty;
+
 var self_id: Id = undefined;
 
-const Id = u16;
 
 const Membership = struct {
     ping_addr: net.IpAddress,
     multicast_addr: net.IpAddress,
     status: std.atomic.Value(NodeStatus),
     pending_ack: std.atomic.Value(i8),
+    incarnation: u32,
 
     pub fn new(port: Id, status: NodeStatus) Membership {
         return .{
@@ -25,6 +36,7 @@ const Membership = struct {
             .multicast_addr = net.IpAddress.parse("127.0.0.1", port+1) catch unreachable,
             .status = .init(status),
             .pending_ack = .init(0),
+            .incarnation = 0,
         };
     }
 };
@@ -77,32 +89,66 @@ fn choose_k_from_members(comptime T: type, random: std.Random, array: []const T,
     return allow_indexes.items[0..@min(k, allow_indexes.items.len)];
 }
 
+pub fn get_latest_change(random: std.Random, arena: Allocator) Changes {
+    const latest = arena.alloc(PackedMember, @min(PIGGYBACK_CAPACITY, changes.items.len)) catch @panic("OOM");
+    const PIGGYBACK_MAX_TIMES: u32 = @ceil(@log(@as(f32, @floatFromInt(memberships.count()))) * 2);
+    for (latest) |*el| {
+        if (change_index >= changes.items.len) {
+            change_index = 0;
+            random.shuffle(ChangeItem, changes.items);
+        }
+        const change_item = &changes.items[change_index];
+        el.* = change_item.change;
+        change_item.count += 1;
+        if (change_item.count >= PIGGYBACK_MAX_TIMES) {
+            _ = changes.swapRemove(change_index);
+        } else {
+            change_index += 1;
+        }
+    }
+    return .{ .memberships = latest };
+}
+
 const Message = struct {
     from: Id,
     src: Id,
     to: Id,
     type: Type,
+
+    piggyback: Changes,
     pub const Type = enum(u8) {
         ping,
         ack,
         ping_req,
     };
 
-    pub const MESSAGE_SIZE = @sizeOf(Message);
+    pub const MESSAGE_SIZE = @sizeOf(Id) * 3 + @sizeOf(Type) + @sizeOf(u32) + @sizeOf(PackedMember) * PIGGYBACK_CAPACITY;
 
-    pub fn serialize(msg: Message) [MESSAGE_SIZE]u8 {
-        return std.mem.asBytes(&msg).*;
+    pub fn serialize(msg: Message, arena: Allocator) []u8 {
+        assert(PIGGYBACK_CAPACITY >= msg.piggyback.memberships.len);
+        var buf: [MESSAGE_SIZE]u8 = undefined;
+        var writer = Io.Writer.fixed(&buf);
+        writer.writeInt(Id, msg.from, .native) catch unreachable;
+        writer.writeInt(Id, msg.src, .native) catch unreachable;
+        writer.writeInt(Id, msg.to, .native) catch unreachable;
+        writer.writeInt(u8, @intFromEnum(msg.type), .native) catch unreachable;
+        msg.piggyback.serialize(&writer) catch unreachable;
+        return arena.dupe(u8, writer.buffered()) catch @panic("OOM");
+    }
+    pub fn deserialize(bytes: []const u8, arena: Allocator) !Message {
+        var reader = Io.Reader.fixed(bytes);
+        const from = try reader.takeInt(Id, .native);
+        const src = try reader.takeInt(Id, .native);
+        const to = try reader.takeInt(Id, .native);
+        const ty = try reader.takeEnum(Type, .native);
+        const piggyback = try Changes.deserialize(&reader, arena);
+        return .{ .from = from, .src = src, .to = to, .type = ty, .piggyback = piggyback };
     }
 
-    pub fn deserialize(bytes: []const u8) Message {
-        assert(bytes.len == MESSAGE_SIZE);
-        return std.mem.bytesToValue(Message, bytes);
-    }
-
-    pub fn recv(io: Io, sock: *const net.Socket) !Message {
+    pub fn recv(io: Io, sock: *const net.Socket, arena: Allocator) !struct { net.IpAddress, Message } {
         var buf: [Message.MESSAGE_SIZE]u8 = undefined;
         const raw_msg = try sock.receive(io, &buf);
-        return Message.deserialize(raw_msg.data);
+        return .{ raw_msg.from, try Message.deserialize(raw_msg.data, arena) };
     }
 };
 
@@ -121,19 +167,24 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         _ = arena_state.reset(.retain_capacity);
 
         var alive_members = std.ArrayList(struct { Id, *Membership }).empty;
+
+        member_mtx.lockUncancelable(io);
         var it = memberships.iterator();
         while  (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const member = entry.value_ptr;
             if (member.status.load(.monotonic) != .dead and id != self_id) alive_members.append(arena, .{ @intCast(id), member }) catch @panic("OOM");
         }
+        const piggyback = get_latest_change(rand, arena);
+        member_mtx.unlock(io);
+
         if (alive_members.items.len == 0)
             continue :ping_loop;
 
         const ping_id, const ping_target = alive_members.items[rand.uintAtMost(usize, alive_members.items.len-1)];
 
         ping_target.pending_ack.store(0, .monotonic);
-        try sock.send(io, &ping_target.ping_addr, &(Message { .type = .ping, .from = self_id, .src = self_id, .to = ping_id }).serialize());
+        try sock.send(io, &ping_target.ping_addr, (Message { .type = .ping, .from = self_id, .src = self_id, .to = ping_id, .piggyback = piggyback }).serialize(arena));
         _ = ping_target.pending_ack.fetchAdd(1, .monotonic);
 
         const start = Io.Timestamp.now(io, .awake);
@@ -142,16 +193,22 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
             if (start.durationTo(now).nanoseconds > NodeStatus.SUSPECTED_TIMEOUT.nanoseconds) break;
         } else continue :ping_loop;
 
-        const PING_REQ_TARGET_COUNT = 1;
+        const PING_REQ_TARGET_COUNT = 2; // `k` in paper
 
-        const ping_req_targets = 
+        const ping_req_targets =
             choose_k_from_members(struct { Id, *Membership }, rand, alive_members.items, PING_REQ_TARGET_COUNT, ping_id, arena);
+        // less than k could be returned
         if (ping_req_targets.len > 0) {
             for (ping_req_targets) |ping_req_id| {
                 _, const ping_req_target = alive_members.items[@intCast(ping_req_id)];
 
                 ping_req_target.pending_ack.store(0, .monotonic);
-                try sock.send(io, &ping_req_target.ping_addr, &(Message { .type = .ping_req, .from = self_id, .src =  self_id, .to = ping_id }).serialize());
+
+                member_mtx.lockUncancelable(io);
+                const new_piggyback = get_latest_change(rand, arena);
+                member_mtx.unlock(io);
+
+                try sock.send(io, &ping_req_target.ping_addr, (Message { .type = .ping_req, .from = self_id, .src =  self_id, .to = ping_id, .piggyback = new_piggyback }).serialize(arena));
                 _ = ping_req_target.pending_ack.fetchAdd(1, .monotonic);
             }
 
@@ -168,44 +225,80 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         log.debug("cannot ping: {}", .{ping_id});
 
         member_mtx.lockUncancelable(io);
+        changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_id, .status = .dead, .incarnation = ping_target.incarnation }}) catch @panic("OOM");
         _ = memberships.swapRemove(ping_id);
         member_mtx.unlock(io);
-        broadcast_change(io, ping_id, .dead) catch |e| {
-            log.err("cannot boardcast dead member {}: {}", .{ ping_id, e });
-            continue :ping_loop;
-        };
     }
 }
 
-fn failure_detector_server(io: Io, _: Allocator, sock: *const net.Socket) !void {
+fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !void {
     const log = std.log.scoped(.ping_server);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    const arena = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0);
+    const rand = prng.random();
+
     while (true) {
-        const msg = Message.recv(io, sock)  catch |e| {
+        _ = arena_state.reset(.retain_capacity);
+        const ip, const msg = Message.recv(io, sock, arena)  catch |e| {
             log.err("recv failed: {}", .{e});
             continue;
         };
 
-        const from = memberships.getPtr(msg.from) orelse continue;
-        const to = memberships.getPtr(msg.to) orelse continue;
         switch (msg.type) {
             .ping => {
-                sock.send(io, &from.ping_addr, &(Message { .from = self_id, .src = self_id, .to = msg.src, .type = .ack }).serialize()) catch |e| {
-                    log.err("sending ack to {f} failed: {}", .{ from.ping_addr, e });
+                const addr =
+                    if (memberships.getPtr(msg.from)) |from|
+                        from.ping_addr
+                    else
+                        ip;
+                sock.send(io, &addr, (Message { .from = self_id, .src = self_id, .to = msg.src, .type = .ack, .piggyback = get_latest_change(rand, arena) }).serialize(arena)) catch |e| {
+                    log.err("sending ack to {f} failed: {}", .{ addr, e });
                 };
             },
             .ack => {
+                const from = memberships.getPtr(msg.from) orelse continue;
+                const to = memberships.getPtr(msg.to) orelse continue;
                 if (msg.to == self_id)
                     _ = from.pending_ack.fetchSub(1, .acquire)
                 else
-                    sock.send(io, &to.ping_addr, &(Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ack }).serialize()) catch |e| {
+                    sock.send(io, &to.ping_addr, (Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ack, .piggyback = get_latest_change(rand, arena) }).serialize(arena)) catch |e| {
                         log.err("fowarding ack sourcing from {} to {} failed: {}", .{ msg.src, msg.to, e });
                     };
             },
             .ping_req => {
-                sock.send(io, &to.ping_addr, &(Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ping }).serialize()) catch |e| {
+                const to = memberships.getPtr(msg.to) orelse continue;
+                sock.send(io, &to.ping_addr, (Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ping, .piggyback = get_latest_change(rand, arena) }).serialize(arena)) catch |e| {
                     log.err("fowarding ping sourcing from {} to {} failed: {}", .{ msg.src, msg.to, e });
                 };
             },
+        }
+        for (msg.piggyback.memberships) |change| {
+            var has_change = false;
+            log.debug("piggyback: {} -> {}", .{change.id, change.status});
+            member_mtx.lockUncancelable(io);
+            defer member_mtx.unlock(io);
+            switch (change.status) {
+                .alive, .suspected => {
+                    const gop = memberships.getOrPut(gpa, change.id) catch @panic("OOM");
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .new(change.id, change.status);
+                        has_change = true;
+                    }
+                    else {
+                        if (gop.value_ptr.status.load(.monotonic) != change.status) {
+                            has_change = true;
+                            gop.value_ptr.status.store(change.status, .monotonic);
+                        }
+                    }
+                },
+                .dead => {
+                    has_change = memberships.swapRemove(change.id);
+                },
+            }
+            if (has_change) changes.append(gpa, .{ .count = 0, .change = change }) catch @panic("OOM");
         }
     }
 }
@@ -213,6 +306,7 @@ fn failure_detector_server(io: Io, _: Allocator, sock: *const net.Socket) !void 
 pub const PackedMember = extern struct {
     id: Id,
     status: NodeStatus,
+    incarnation: u32,
 };
 
 
@@ -220,11 +314,9 @@ const MulticastRequest = union(Type) {
 
     pub const Type = enum(u8) {
         intro,
-        member_change,
         hello,
     };
     intro: Id, // port number of ping_address
-    member_change: PackedMember,
     hello,
 
     pub fn deserialize(reader: *Io.Reader) !MulticastRequest {
@@ -233,10 +325,6 @@ const MulticastRequest = union(Type) {
             .intro => {
                 const port = try reader.takeInt(Id, .native);
                 return .{ .intro = port };
-            },
-            .member_change => {
-                const member = try reader.takeStruct(PackedMember, .native);
-                return  .{ .member_change = member };
             },
             .hello => return .hello,
         }
@@ -248,18 +336,15 @@ const MulticastRequest = union(Type) {
             .intro => |port| {
                 try writer.writeInt(Id, port, .native);
             },
-            .member_change => |member| {
-                try writer.writeStruct(member, .native);
-            },
             .hello => {},
         }
     }
 };
 
-const Introduction = struct {
+const Changes = struct {
     memberships: []const PackedMember,
 
-    pub fn deserialize(reader: *Io.Reader, arena: Allocator) !Introduction {
+    pub fn deserialize(reader: *Io.Reader, arena: Allocator) !Changes {
         const count = try reader.takeInt(u32, .native);
         const members = arena.alloc(PackedMember, count) catch @panic("OOM");
         for (members) |*member| {
@@ -268,7 +353,7 @@ const Introduction = struct {
         return .{ .memberships = members };
     }
 
-    pub fn serialize(self: Introduction, writer: *Io.Writer) !void {
+    pub fn serialize(self: Changes, writer: *Io.Writer) !void {
         try writer.writeInt(u32, @intCast(self.memberships.len), .native);
         try writer.writeSliceEndian(PackedMember, self.memberships, .native);
     }
@@ -317,35 +402,16 @@ fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
                     const member = entry.value_ptr;
                     const status = member.status.load(.monotonic);
                     if (status != .dead)
-                        packed_members.append(arena, .{ .id = @intCast(id), .status = status }) catch @panic("OOM");
+                        packed_members.append(arena, .{ .id = @intCast(id), .status = status, .incarnation = 0 }) catch @panic("OOM");
                 }
+                changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_port, .status = .alive, .incarnation = 0 } }) catch @panic("OOM");
                 member_mtx.unlock(io);
 
-                (Introduction {.memberships = packed_members.items}).serialize(&writer.interface) catch |e| {
+                (Changes {.memberships = packed_members.items}).serialize(&writer.interface) catch |e| {
                     log.err("introducer failed to send introduction: {}", .{e});
                     continue;
                 };
 
-                broadcast_change(io, ping_port, .alive) catch |e| {
-                    log.err("cannot boardcast new member {}: {}", .{ ping_port, e });
-                    continue;
-                };
-            },
-            .member_change => |member| {
-                member_mtx.lockUncancelable(io);
-                defer member_mtx.unlock(io);
-                switch (member.status) {
-                    .alive, .suspected => {
-                        const gop = memberships.getOrPut(gpa, member.id) catch @panic("OOM");
-                        if (!gop.found_existing)
-                            gop.value_ptr.* = .new(member.id, member.status)
-                        else
-                            gop.value_ptr.status.store(member.status, .monotonic);
-                    },
-                    .dead => {
-                        _ = memberships.swapRemove(member.id);
-                    },
-                }
             },
             .hello => {
                 writer.interface.writeByte(69) catch continue;
@@ -374,35 +440,13 @@ fn intro(io: Io, gpa: Allocator, id: Id, ip_addr: net.IpAddress) !void {
     try writer.interface.flush();
     try stream.shutdown(io, .send);
 
-    const introduction = try Introduction.deserialize(&reader.interface, arena);
+    const introduction = try Changes.deserialize(&reader.interface, arena);
     std.log.info("introduction, new members: {}", .{ introduction.memberships.len });
     try member_mtx.lock(io);
     for (introduction.memberships) |intro_member| {
         memberships.put(gpa, intro_member.id, .new(intro_member.id, intro_member.status)) catch @panic("OOM");
     }
     member_mtx.unlock(io);
-}
-
-fn broadcast_change(io: Io, member_id: Id, status: NodeStatus) !void {
-    var it = memberships.iterator();
-    while (it.next()) |entry| {
-        const id = entry.key_ptr.*;
-        const member = entry.value_ptr;
-        if (id == self_id or member.status.load(.monotonic) == .dead) continue;
-        const stream = member.multicast_addr.connect(io, .{ .mode = .stream }) catch |e| {
-            std.log.err("cannot connect to {f}", .{member.multicast_addr});
-            return e;
-        };
-        defer stream.close(io);
-
-        var writer_buf: [256]u8 = undefined;
-        var writer = stream.writer(io, &writer_buf);
-
-        const req = MulticastRequest { .member_change = .{ .id = member_id, .status = status } };
-        try req.serialize(&writer.interface);
-        try writer.interface.flush();
-        try stream.shutdown(io, .send);
-    }
 }
 
 fn print_color(term: Io.Terminal, color: Io.Terminal.Color, comptime fmt: []const u8, args: anytype) void {
@@ -438,6 +482,7 @@ pub fn main(init: std.process.Init) !void {
         .ping_addr = try net.IpAddress.parse("127.0.0.1", ping_port),
         .multicast_addr = try net.IpAddress.parse("127.0.0.1", multicast_port),
         .pending_ack = .init(0),
+        .incarnation = 0,
     };
     memberships.put(gpa, ping_port, self) catch @panic("OOM");
 
@@ -475,16 +520,21 @@ pub fn main(init: std.process.Init) !void {
 const testing = std.testing;
 
 test Message {
-    const msg1 = Message { .src = 0, .from = 0, .to = 1, .type = .ping };
-    const buf = msg1.serialize();
-    const msg2 = Message.deserialize(&buf);
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
 
-    try testing.expectEqual(msg1, msg2);
+    const piggyback = Changes { .memberships = &.{ .{ .id = 69, .status = .alive, .incarnation = 101, }, .{ .id = 420, .status = .suspected, .incarnation = 250 } } };
+    const msg1 = Message { .src = 0, .from = 0, .to = 1, .type = .ping, .piggyback = piggyback };
+    const buf = msg1.serialize(arena_state.allocator());
+    const msg2 = Message.deserialize(buf, arena_state.allocator());
+
+    try testing.expectEqualDeep(msg1, msg2);
 }
 
 test MulticastRequest {
     const gpa = testing.allocator;
-    const req1 = MulticastRequest { .member_change = .{ .status = .alive, .id = 69 }};
+    const req1 = MulticastRequest { .intro = 8000 };
     var writer = Io.Writer.Allocating.init(gpa);
     defer writer.deinit();
     try req1.serialize(&writer.writer);
@@ -495,17 +545,17 @@ test MulticastRequest {
     try testing.expectEqual(req1, req2);
 }
 
-test Introduction {
+test Changes {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const in1 = Introduction { .memberships = &.{ .{ .id = 69, .status = .alive, }, .{ .id = 420, .status = .suspected } }};
+    const in1 = Changes { .memberships = &.{ .{ .id = 69, .status = .alive, .incarnation = 0,}, .{ .id = 420, .status = .suspected, .incarnation = 365 } }};
     var buf: [256]u8 = undefined;
     var writer = Io.Writer.fixed(&buf);
     try in1.serialize(&writer);
 
     var reader = Io.Reader.fixed(writer.buffered());
-    const in2 = Introduction.deserialize(&reader, arena_state.allocator());
+    const in2 = Changes.deserialize(&reader, arena_state.allocator());
 
     try testing.expectEqualDeep(in1, in2);
 }

@@ -25,7 +25,7 @@ Group join can be implement similarly.
 
 No more multicast. Membership udpates are carried through `ping`, `ping-req`, and `ack`.
 
-Each node maintains a list of reeent membership changes. Theses changes are piggybacked on the messages sent by the failture detector.
+Each node maintains a list of recent membership changes. Theses changes are piggybacked on the messages sent by the failture detector.
 
 Changes that are sent less should be prefered. A change can be removed from the list after being sent `y log N` times, where `y` is a parameter.
 
