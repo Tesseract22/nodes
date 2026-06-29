@@ -347,7 +347,7 @@ pub const PackedMember = extern struct {
 };
 
 
-const MulticastRequest = union(Type) {
+pub const MulticastRequest = union(Type) {
 
     pub const Type = enum(u8) {
         intro,
@@ -378,7 +378,7 @@ const MulticastRequest = union(Type) {
     }
 };
 
-const Changes = struct {
+pub const Changes = struct {
     memberships: []const PackedMember,
 
     pub fn deserialize(reader: *Io.Reader, arena: Allocator) !Changes {
@@ -395,6 +395,8 @@ const Changes = struct {
         try writer.writeSliceEndian(PackedMember, self.memberships, .native);
     }
 };
+
+pub const MONITOR_PORT = 3000;
 
 fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
     const log = std.log.scoped(.multicast_server);
@@ -441,14 +443,15 @@ fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
                     if (status != .dead)
                         packed_members.append(arena, .{ .id = @intCast(id), .status = status, .incarnation = 0 }) catch @panic("OOM");
                 }
-                changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_port, .status = .alive, .incarnation = 0 } }) catch @panic("OOM");
+                if (ping_port != MONITOR_PORT) {
+                    changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_port, .status = .alive, .incarnation = 0 } }) catch @panic("OOM");
+                }
                 member_mtx.unlock(io);
 
                 (Changes {.memberships = packed_members.items}).serialize(&writer.interface) catch |e| {
                     log.err("introducer failed to send introduction: {}", .{e});
                     continue;
                 };
-
             },
             .hello => {
                 writer.interface.writeByte(69) catch continue;
