@@ -29,6 +29,7 @@ const Membership = struct {
     status: std.atomic.Value(NodeStatus),
     pending_ack: std.atomic.Value(i8),
     incarnation: u32,
+    suspected_start: Io.Timestamp, 
 
     pub fn new(port: Id, status: NodeStatus) Membership {
         return .{
@@ -37,6 +38,7 @@ const Membership = struct {
             .status = .init(status),
             .pending_ack = .init(0),
             .incarnation = 0,
+            .suspected_start = .{.nanoseconds = 0},
         };
     }
 };
@@ -68,9 +70,10 @@ const NodeStatus = enum(u8) {
     alive,
 
     pub const NETWORK_ROUNDTRIP_TIME = Duration.fromMilliseconds(1000);
-    pub const SUSPECTED_TIMEOUT = Duration { .nanoseconds = NETWORK_ROUNDTRIP_TIME.nanoseconds * 1 };
-    pub const DEAD_TIMEOUT = Duration { .nanoseconds = NETWORK_ROUNDTRIP_TIME.nanoseconds * 2 };
-    comptime { assert(DEAD_TIMEOUT.nanoseconds > SUSPECTED_TIMEOUT.nanoseconds); }
+    pub const PING_TIMEOUT = Duration { .nanoseconds = NETWORK_ROUNDTRIP_TIME.nanoseconds * 1 };
+    pub const PING_REQ_TIMEOUT = Duration { .nanoseconds = NETWORK_ROUNDTRIP_TIME.nanoseconds * 2 };
+    pub const DEAD_TIMEOUT = Duration { .nanoseconds = NETWORK_ROUNDTRIP_TIME.nanoseconds * 4 };
+    comptime { assert(PING_REQ_TIMEOUT.nanoseconds > PING_TIMEOUT.nanoseconds); }
     pub const PING_INTERVAL = Duration.fromMilliseconds(500);
 };
 
@@ -173,7 +176,16 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         while  (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const member = entry.value_ptr;
-            if (member.status.load(.monotonic) != .dead and id != self_id) alive_members.append(arena, .{ @intCast(id), member }) catch @panic("OOM");
+            if (id == self_id) continue;
+            switch (member.status.load(.monotonic)) {
+                .alive => alive_members.append(arena, .{ @intCast(id), member }) catch @panic("OOM"),
+                .suspected => {
+                    if (member.suspected_start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds > NodeStatus.DEAD_TIMEOUT.nanoseconds) {
+                        member.status.store(.dead, .monotonic);
+                    }
+                },
+                .dead => {},
+            }
         }
         const piggyback = get_latest_change(rand, arena);
         member_mtx.unlock(io);
@@ -190,7 +202,7 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         const start = Io.Timestamp.now(io, .awake);
         while (ping_target.pending_ack.load(.acquire) > 0) {
             const now = Io.Timestamp.now(io, .awake);
-            if (start.durationTo(now).nanoseconds > NodeStatus.SUSPECTED_TIMEOUT.nanoseconds) break;
+            if (start.durationTo(now).nanoseconds > NodeStatus.PING_TIMEOUT.nanoseconds) break;
         } else continue :ping_loop;
 
         const PING_REQ_TARGET_COUNT = 2; // `k` in paper
@@ -214,7 +226,7 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
 
             while (true) {
                 const now = Io.Timestamp.now(io, .awake);
-                if (start.durationTo(now).nanoseconds > NodeStatus.DEAD_TIMEOUT.nanoseconds) break;
+                if (start.durationTo(now).nanoseconds > NodeStatus.PING_REQ_TIMEOUT.nanoseconds) break;
                 for (ping_req_targets) |ping_req_id| {
                     _, const ping_req_target = alive_members.items[@intCast(ping_req_id)];
                     if (ping_req_target.pending_ack.load(.acquire) <= 0) continue :ping_loop;
@@ -226,7 +238,8 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
 
         member_mtx.lockUncancelable(io);
         changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_id, .status = .dead, .incarnation = ping_target.incarnation }}) catch @panic("OOM");
-        _ = memberships.swapRemove(ping_id);
+        ping_target.status.store(.alive, .monotonic);
+        ping_target.suspected_start = Io.Timestamp.now(io, .awake);
         member_mtx.unlock(io);
     }
 }
@@ -249,6 +262,7 @@ fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
 
         switch (msg.type) {
             .ping => {
+                // event if the ping is not from a known member, we still send ACK back to the sender.
                 const addr =
                     if (memberships.getPtr(msg.from)) |from|
                         from.ping_addr
@@ -281,14 +295,37 @@ fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
             member_mtx.lockUncancelable(io);
             defer member_mtx.unlock(io);
             switch (change.status) {
-                .alive, .suspected => {
+                .alive => {
                     const gop = memberships.getOrPut(gpa, change.id) catch @panic("OOM");
+                    const member = gop.value_ptr;
                     if (!gop.found_existing) {
-                        gop.value_ptr.* = .new(change.id, change.status);
+                        member.* = .new(change.id, change.status);
                         has_change = true;
                     }
                     else {
-                        if (gop.value_ptr.status.load(.monotonic) != change.status) {
+                        if (member.status.load(.monotonic) != .dead and change.incarnation > member.incarnation) {
+                            member.incarnation = change.incarnation;
+                            member.status.store(change.status, .monotonic);
+                            has_change = true;
+                        }
+                    }
+                },
+                .suspected => {
+                    const gop = memberships.getOrPut(gpa, change.id) catch @panic("OOM");
+                    const member = gop.value_ptr;
+                    if (!gop.found_existing) {
+                        member.* = .new(change.id, change.status);
+                        has_change = true;
+                    }
+                    else {
+                        const old_status = member.status.load(.monotonic);
+                        if (old_status == .suspected
+                            and change.incarnation > member.incarnation) {
+                            has_change = true;
+                            gop.value_ptr.status.store(change.status, .monotonic);
+                        }
+                        if (old_status == .alive
+                            and change.incarnation >= member.incarnation) {
                             has_change = true;
                             gop.value_ptr.status.store(change.status, .monotonic);
                         }
@@ -483,6 +520,7 @@ pub fn main(init: std.process.Init) !void {
         .multicast_addr = try net.IpAddress.parse("127.0.0.1", multicast_port),
         .pending_ack = .init(0),
         .incarnation = 0,
+        .suspected_start = .{.nanoseconds=0}
     };
     memberships.put(gpa, ping_port, self) catch @panic("OOM");
 

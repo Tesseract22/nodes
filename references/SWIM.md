@@ -37,6 +37,6 @@ This change is added to the list of membership changes, and carried through the 
 
 Other members upon receiving such message, would mark `j` as `suspected` as well (and added to the list of changes). A suspected member should still be valid target of `ping`.
 
-When `i` receive a ping from a suspected member `j`, it should spreads `{ Alive j: i knows j }`. Otherwise, the entry `j` in `i` should expire after some time, where `{ Confgirm: i delcares j as dead }`.
+When `i` receive a ping from a suspected member `j`, it should spreads `{ Alive j: i knows j }`. Otherwise, the entry `j` in `i` should expire after some time, with `{ Confgirm: i delcares j as dead }`.
 
 An incarnation number is thus needed to be carried through in each of this piggybacked message. When `j` receive a suspicion about itself, it should starts piggybacking `{ Alive: j knows j }` with a incremented incarnation number.
