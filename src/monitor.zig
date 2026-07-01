@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             var reader_buf: [64]u8 = undefined;
             var writer = stream.writer(io, &writer_buf);
             var reader = stream.reader(io, &reader_buf);
-            const req = FailureDector.MulticastRequest { .intro = FailureDector.MONITOR_PORT };
+            const req = FailureDector.MulticastRequest { .intro = net.IpAddress.parse("127.0.0.1", FailureDector.MONITOR_PORT) catch unreachable };
             log.info("intro sent", .{});
             req.serialize(&writer.interface) catch |e| {
                 try stdout.print("cannot send request: {}\n", .{e});
@@ -89,7 +89,6 @@ pub fn main(init: std.process.Init) !void {
             for (introduction.memberships) |member| {
                 try stdout.print("{}: {}: {}\n", .{member.id, member.status, member.incarnation});
             }
-
         } else if (std.mem.eql(u8, command, "udp")) {
             // const port_str = tks.next() orelse {
             //     try stdout.print("expect <port>\n", .{});

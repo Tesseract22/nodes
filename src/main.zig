@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const NetworkConfig = @import("network_config");
 
 const MembershipList = std.AutoArrayHashMapUnmanaged(Id, Membership);
-const Id = u16;
+const Id = net.IpAddress;
 
 var memberships = MembershipList.empty;
 var member_mtx = Io.Mutex.init;
@@ -29,12 +29,14 @@ const Membership = struct {
     status: std.atomic.Value(NodeStatus),
     pending_ack: std.atomic.Value(i8),
     incarnation: u32,
-    suspected_start: Io.Timestamp, 
+    suspected_start: Io.Timestamp,
 
-    pub fn new(port: Id, status: NodeStatus) Membership {
+    pub fn new(ip: Id, status: NodeStatus) Membership {
+        var multicast_addr = ip;
+        multicast_addr.setPort(multicast_addr.getPort()+1);
         return .{
-            .ping_addr = net.IpAddress.parse("127.0.0.1", port) catch unreachable,
-            .multicast_addr = net.IpAddress.parse("127.0.0.1", port+1) catch unreachable,
+            .ping_addr = ip,
+            .multicast_addr = multicast_addr,
             .status = .init(status),
             .pending_ack = .init(0),
             .incarnation = 0,
@@ -46,13 +48,13 @@ const Membership = struct {
 fn print_memberships(io: Io, term: Io.Terminal, ships: MembershipList) !void {
     _ = io;
     const stdout = term.writer;
-    try stdout.print("{s: <10}{s: <10}\n", .{ "id", "status" });
+    try stdout.print("{s: <50}{s: <10}\n", .{ "id", "status" });
     var it = ships.iterator();
     while (it.next()) |entry| {
         const id = entry.key_ptr.*;
         const member = entry.value_ptr;
-        const id_color: Io.Terminal.Color = if (self_id == id) .blue else .reset;
-        print_color(term, id_color, "{: <10}", .{ id });
+        const id_color: Io.Terminal.Color = if (std.meta.eql(self_id, id)) .blue else .reset;
+        print_color(term, id_color, "{f: <50}", .{ id });
         const status = member.status.load(.monotonic);
         const status_color: Io.Terminal.Color = switch (status) {
             .alive => .green,
@@ -82,7 +84,7 @@ const Terminal = struct {
     const move_up = "\x1b[1A";
 };
 
-fn choose_k_from_members(comptime T: type, random: std.Random, array: []const T, k: u32, exclude: Id, arena: Allocator) []u32 {
+fn choose_k_from_members(comptime T: type, random: std.Random, array: []const T, k: u32, exclude: usize, arena: Allocator) []u32 {
     var allow_indexes = std.ArrayList(u32).empty;
     for (array, 0..) |_, id| {
         if (id == exclude) continue;
@@ -131,19 +133,19 @@ const Message = struct {
         assert(PIGGYBACK_CAPACITY >= msg.piggyback.memberships.len);
         var buf: [MESSAGE_SIZE]u8 = undefined;
         var writer = Io.Writer.fixed(&buf);
-        writer.writeInt(Id, msg.from, .native) catch unreachable;
-        writer.writeInt(Id, msg.src, .native) catch unreachable;
-        writer.writeInt(Id, msg.to, .native) catch unreachable;
-        writer.writeInt(u8, @intFromEnum(msg.type), .native) catch unreachable;
+        ip_write(msg.from, &writer) catch unreachable;
+        ip_write(msg.src, &writer) catch unreachable;
+        ip_write(msg.to, &writer) catch unreachable;
+        writer.writeInt(u8, @intFromEnum(msg.type), .little) catch unreachable;
         msg.piggyback.serialize(&writer) catch unreachable;
         return arena.dupe(u8, writer.buffered()) catch @panic("OOM");
     }
     pub fn deserialize(bytes: []const u8, arena: Allocator) !Message {
         var reader = Io.Reader.fixed(bytes);
-        const from = try reader.takeInt(Id, .native);
-        const src = try reader.takeInt(Id, .native);
-        const to = try reader.takeInt(Id, .native);
-        const ty = try reader.takeEnum(Type, .native);
+        const from = try ip_read(&reader);
+        const src = try ip_read(&reader);
+        const to = try ip_read(&reader);
+        const ty = try reader.takeEnum(Type, .little);
         const piggyback = try Changes.deserialize(&reader, arena);
         return .{ .from = from, .src = src, .to = to, .type = ty, .piggyback = piggyback };
     }
@@ -176,9 +178,9 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         while  (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const member = entry.value_ptr;
-            if (id == self_id) continue;
+            if (std.meta.eql(id, self_id)) continue;
             switch (member.status.load(.monotonic)) {
-                .alive => alive_members.append(arena, .{ @intCast(id), member }) catch @panic("OOM"),
+                .alive => alive_members.append(arena, .{ id, member }) catch @panic("OOM"),
                 .suspected => {
                     if (member.suspected_start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds > NodeStatus.DEAD_TIMEOUT.nanoseconds) {
                         member.status.store(.dead, .monotonic);
@@ -193,7 +195,8 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         if (alive_members.items.len == 0)
             continue :ping_loop;
 
-        const ping_id, const ping_target = alive_members.items[rand.uintAtMost(usize, alive_members.items.len-1)];
+        const rand_idx = rand.uintAtMost(usize, alive_members.items.len-1);
+        const ping_id, const ping_target = alive_members.items[rand_idx];
 
         ping_target.pending_ack.store(0, .monotonic);
         try sock.send(io, &ping_target.ping_addr, (Message { .type = .ping, .from = self_id, .src = self_id, .to = ping_id, .piggyback = piggyback }).serialize(arena));
@@ -208,7 +211,7 @@ fn failure_detector_pinger(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         const PING_REQ_TARGET_COUNT = 2; // `k` in paper
 
         const ping_req_targets =
-            choose_k_from_members(struct { Id, *Membership }, rand, alive_members.items, PING_REQ_TARGET_COUNT, ping_id, arena);
+            choose_k_from_members(struct { Id, *Membership }, rand, alive_members.items, PING_REQ_TARGET_COUNT, rand_idx, arena);
         // less than k could be returned
         if (ping_req_targets.len > 0) {
             for (ping_req_targets) |ping_req_id| {
@@ -275,7 +278,7 @@ fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
             .ack => {
                 const from = memberships.getPtr(msg.from) orelse continue;
                 const to = memberships.getPtr(msg.to) orelse continue;
-                if (msg.to == self_id)
+                if (std.meta.eql(msg.to, self_id))
                     _ = from.pending_ack.fetchSub(1, .acquire)
                 else
                     sock.send(io, &to.ping_addr, (Message { .from = self_id, .src = msg.src, .to = msg.to, .type = .ack, .piggyback = get_latest_change(rand, arena) }).serialize(arena)) catch |e| {
@@ -291,7 +294,7 @@ fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
         }
         for (msg.piggyback.memberships) |change| {
             var has_change = false;
-            log.debug("piggyback: {} -> {}", .{change.id, change.status});
+            log.debug("piggyback: {f} -> {}", .{change.id, change.status});
             member_mtx.lockUncancelable(io);
             defer member_mtx.unlock(io);
             switch (change.status) {
@@ -340,11 +343,46 @@ fn failure_detector_server(io: Io, gpa: Allocator, sock: *const net.Socket) !voi
     }
 }
 
-pub const PackedMember = extern struct {
+pub const PackedMember = struct {
     id: Id,
     status: NodeStatus,
     incarnation: u32,
 };
+
+pub fn ip_write(ip: net.IpAddress, writer: *Io.Writer) !void {
+    try writer.writeByte(@intFromEnum(ip));
+    switch (ip) {
+        .ip4 => |ipv4| {
+            try writer.writeInt(u16, ipv4.port, .little);
+            try writer.writeSliceEndian(u8, &ipv4.bytes, .little);
+        },
+        .ip6 => |ipv6| {
+            try writer.writeInt(u16, ipv6.port, .little);
+            try writer.writeSliceEndian(u8, &ipv6.bytes, .little);
+            try writer.writeInt(u32, ipv6.interface.index, .little);
+        }
+    }
+}
+
+pub fn ip_read(reader: *Io.Reader) !net.IpAddress {
+    const tag_raw = try reader.takeByte();
+    const tag = std.enums.fromInt(net.IpAddress.Family, tag_raw) orelse return error.CorruptedIpFamily;
+    switch (tag) {
+        .ip4 => {
+            const port = try reader.takeInt(u16, .little);
+            var bytes: [4]u8 = undefined;
+            try reader.readSliceEndian(u8, &bytes, .little);
+            return .{ .ip4 = .{ .port = port, .bytes = bytes } };
+        },
+        .ip6 => {
+            const port = try reader.takeInt(u16, .little);
+            var bytes: [16]u8 = undefined;
+            try reader.readSliceEndian(u8, &bytes, .little);
+            const interface = try reader.takeInt(u32, .little);
+            return .{ .ip6 = .{ .port = port, .bytes = bytes, .interface = .{ .index = interface } } };
+        }
+    }
+}
 
 
 pub const MulticastRequest = union(Type) {
@@ -357,11 +395,11 @@ pub const MulticastRequest = union(Type) {
     hello,
 
     pub fn deserialize(reader: *Io.Reader) !MulticastRequest {
-        const ty = try reader.takeEnum(Type, .native);
+        const ty = try reader.takeEnum(Type, .little);
         switch (ty) {
             .intro => {
-                const port = try reader.takeInt(Id, .native);
-                return .{ .intro = port };
+                const ip = try ip_read(reader);
+                return .{ .intro = ip };
             },
             .hello => return .hello,
         }
@@ -370,8 +408,8 @@ pub const MulticastRequest = union(Type) {
     pub fn serialize(self: MulticastRequest, writer: *Io.Writer) !void {
         try writer.writeByte(@intFromEnum(self));
         switch (self) {
-            .intro => |port| {
-                try writer.writeInt(Id, port, .native);
+            .intro => |ip| {
+                try ip_write(ip, writer);
             },
             .hello => {},
         }
@@ -382,17 +420,23 @@ pub const Changes = struct {
     memberships: []const PackedMember,
 
     pub fn deserialize(reader: *Io.Reader, arena: Allocator) !Changes {
-        const count = try reader.takeInt(u32, .native);
+        const count = try reader.takeInt(u32, .little);
         const members = arena.alloc(PackedMember, count) catch @panic("OOM");
         for (members) |*member| {
-            member.* = try reader.takeStruct(PackedMember, .native);
+            member.incarnation = try reader.takeInt(u32, .little);
+            member.status = try reader.takeEnum(NodeStatus, .little);
+            member.id = try ip_read(reader);
         }
         return .{ .memberships = members };
     }
 
     pub fn serialize(self: Changes, writer: *Io.Writer) !void {
-        try writer.writeInt(u32, @intCast(self.memberships.len), .native);
-        try writer.writeSliceEndian(PackedMember, self.memberships, .native);
+        try writer.writeInt(u32, @intCast(self.memberships.len), .little);
+        for (self.memberships) |member| {
+            try writer.writeInt(u32, member.incarnation, .little);
+            try writer.writeByte(@intFromEnum(member.status));
+            try ip_write(member.id, writer);
+        }
     }
 };
 
@@ -441,9 +485,9 @@ fn multicast_server(io: Io, gpa: Allocator, ip_addr: net.IpAddress) void {
                     const member = entry.value_ptr;
                     const status = member.status.load(.monotonic);
                     if (status != .dead)
-                        packed_members.append(arena, .{ .id = @intCast(id), .status = status, .incarnation = 0 }) catch @panic("OOM");
+                        packed_members.append(arena, .{ .id = id, .status = status, .incarnation = 0 }) catch @panic("OOM");
                 }
-                if (ping_port != MONITOR_PORT) {
+                if (ping_port.getPort() != MONITOR_PORT) {
                     changes.append(gpa, .{ .count = 0, .change = .{ .id = ping_port, .status = .alive, .incarnation = 0 } }) catch @panic("OOM");
                 }
                 member_mtx.unlock(io);
@@ -516,16 +560,16 @@ pub fn main(init: std.process.Init) !void {
     std.log.debug("size of gossip message: {}", .{ Message.MESSAGE_SIZE });
     std.log.debug("ping port: {}, multicast port: {}", .{ ping_port, multicast_port });
 
-    self_id = ping_port;
+    self_id = try net.IpAddress.parse("127.0.0.1", ping_port);
     const self = Membership {
         .status = .init(.alive),
-        .ping_addr = try net.IpAddress.parse("127.0.0.1", ping_port),
+        .ping_addr = self_id,
         .multicast_addr = try net.IpAddress.parse("127.0.0.1", multicast_port),
         .pending_ack = .init(0),
         .incarnation = 0,
         .suspected_start = .{.nanoseconds=0}
     };
-    memberships.put(gpa, ping_port, self) catch @panic("OOM");
+    memberships.put(gpa, self_id, self) catch @panic("OOM");
 
     const sock = try self.ping_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sock.close(io);
@@ -534,7 +578,7 @@ pub fn main(init: std.process.Init) !void {
     var server_fut = try io.concurrent(failure_detector_server, .{ io, gpa, &sock });
     defer { pinger_fut.cancel(io) catch unreachable; server_fut.cancel(io) catch unreachable; }
     _ = try io.concurrent(multicast_server, .{ io, gpa, self.multicast_addr });
-    if (self_id != 8000) {
+    if (self_id.getPort() != 8000) {
         const known_introducer_port = 8001;
         const introducer_addr = try net.IpAddress.parse("127.0.0.1", known_introducer_port);
         intro(io, gpa, self_id, introducer_addr) catch |e| {
@@ -565,8 +609,11 @@ test Message {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const piggyback = Changes { .memberships = &.{ .{ .id = 69, .status = .alive, .incarnation = 101, }, .{ .id = 420, .status = .suspected, .incarnation = 250 } } };
-    const msg1 = Message { .src = 0, .from = 0, .to = 1, .type = .ping, .piggyback = piggyback };
+    const id1 = try net.IpAddress.parse("192.168.1.1", 4200);
+    const id2 = try net.IpAddress.parse("2001:0db8:85a3:0000:8a2e:0370:7334:1234", 1234);
+
+    const piggyback = Changes { .memberships = &.{ .{ .id = id1, .status = .alive, .incarnation = 101, }, .{ .id = id2, .status = .suspected, .incarnation = 250 } } };
+    const msg1 = Message { .src = id1, .from = id1, .to = id2, .type = .ping, .piggyback = piggyback };
     const buf = msg1.serialize(arena_state.allocator());
     const msg2 = Message.deserialize(buf, arena_state.allocator());
 
@@ -575,7 +622,8 @@ test Message {
 
 test MulticastRequest {
     const gpa = testing.allocator;
-    const req1 = MulticastRequest { .intro = 8000 };
+    const id1 = try net.IpAddress.parse("192.168.1.1", 4200);
+    const req1 = MulticastRequest { .intro = id1 };
     var writer = Io.Writer.Allocating.init(gpa);
     defer writer.deinit();
     try req1.serialize(&writer.writer);
@@ -590,7 +638,9 @@ test Changes {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const in1 = Changes { .memberships = &.{ .{ .id = 69, .status = .alive, .incarnation = 0,}, .{ .id = 420, .status = .suspected, .incarnation = 365 } }};
+    const id1 = try net.IpAddress.parse("192.168.1.1", 4200);
+    const id2 = try net.IpAddress.parse("2001:0db8:85a3:0000:8a2e:0370:7334:1234", 1234);
+    const in1 = Changes { .memberships = &.{ .{ .id = id1, .status = .alive, .incarnation = 0,}, .{ .id = id2, .status = .suspected, .incarnation = 365 } }};
     var buf: [256]u8 = undefined;
     var writer = Io.Writer.fixed(&buf);
     try in1.serialize(&writer);
@@ -599,4 +649,25 @@ test Changes {
     const in2 = Changes.deserialize(&reader, arena_state.allocator());
 
     try testing.expectEqualDeep(in1, in2);
+}
+
+test "IpAddress Read/Write" {
+    const ip1 = try net.IpAddress.parse("127.0.0.1", 8000);
+    var buf: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    try ip_write(ip1, &writer);
+
+    var reader = Io.Reader.fixed(writer.buffered());
+    const ip1_ = try ip_read(&reader);
+
+    try testing.expectEqualDeep(ip1, ip1_);
+
+    const ip2 = try net.IpAddress.parse("::", 6969);
+    writer = Io.Writer.fixed(&buf);
+    try ip_write(ip2, &writer);
+
+    reader = Io.Reader.fixed(writer.buffered());
+    const ip2_ = try ip_read(&reader);
+
+    try testing.expectEqualDeep(ip2, ip2_);
 }
